@@ -9,14 +9,16 @@ import json
 import random
 import re
 import time as _time
+import traceback
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
 
 intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
+intents.message_content = os.getenv("ENABLE_MESSAGE_CONTENT_INTENT", "false").lower() in {"1", "true", "yes"}
+# Slash commands and button interactions provide the member data used by this bot.
+intents.members = False
 
 
 def _is_admin(user: discord.Member | discord.User) -> bool:
@@ -74,6 +76,20 @@ class RestrictedCommandTree(app_commands.CommandTree):
 
 
 bot = commands.Bot(command_prefix="!", intents=intents, tree_cls=RestrictedCommandTree)
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    print(f"[Slash command] {getattr(interaction.command, 'qualified_name', 'unknown')} failed:", flush=True)
+    traceback.print_exception(type(error), error, error.__traceback__)
+    try:
+        message = "Something went wrong while running that command. Please contact a server admin."
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.HTTPException:
+        pass
 
 GUILD_IDS = [
     discord.Object(id=1488636168709996548),
@@ -1364,11 +1380,16 @@ async def _end_giveaway(client: discord.Client, gw_id: str):
         return
     entries = g["entries"]
     winners = random.sample(entries, min(g["winners_count"], len(entries))) if entries else []
-    g["ended"] = True
-    save_giveaways()
-
     channel = client.get_channel(g["channel_id"])
     if not channel:
+        try:
+            channel = await client.fetch_channel(g["channel_id"])
+        except discord.HTTPException as exc:
+            print(f"[giveaway] channel lookup failed for {gw_id}: {exc}")
+            return
+
+    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        print(f"[giveaway] channel is not a text channel for {gw_id}")
         return
 
     try:
@@ -1377,24 +1398,31 @@ async def _end_giveaway(client: discord.Client, gw_id: str):
     except Exception as exc:
         print(f"[giveaway] end-edit error: {exc}")
 
-    if winners:
-        mentions = " ".join(f"<@{w}>" for w in winners)
-        announce = discord.Embed(
-            title="We Have a Winner!",
-            description=f"{mentions} {'has' if len(winners) == 1 else 'have'} won the giveaway!\n\n**Prize:** {g['prize']}",
-            color=GW_YELLOW,
-        )
-        announce.add_field(name="Winner(s)", value="\n".join(f"• <@{w}>" for w in winners), inline=False)
-        announce.add_field(name="Hosted by", value=f"<@{g['host_id']}>", inline=True)
-        announce.set_footer(text="Congratulations!")
-        announce.timestamp = datetime.now(timezone.utc)
-        await channel.send(content=mentions, embed=announce)
-    else:
-        await channel.send(embed=discord.Embed(
-            title="Giveaway Ended — No Winners",
-            description=f"The **{g['prize']}** giveaway ended with no entries.",
-            color=GW_GRAY,
-        ))
+    try:
+        if winners:
+            mentions = " ".join(f"<@{w}>" for w in winners)
+            announce = discord.Embed(
+                title="We Have a Winner!",
+                description=f"{mentions} {'has' if len(winners) == 1 else 'have'} won the giveaway!\n\n**Prize:** {g['prize']}",
+                color=GW_YELLOW,
+            )
+            announce.add_field(name="Winner(s)", value="\n".join(f"• <@{w}>" for w in winners), inline=False)
+            announce.add_field(name="Hosted by", value=f"<@{g['host_id']}>", inline=True)
+            announce.set_footer(text="Congratulations!")
+            announce.timestamp = datetime.now(timezone.utc)
+            await channel.send(content=mentions, embed=announce)
+        else:
+            await channel.send(embed=discord.Embed(
+                title="Giveaway Ended — No Winners",
+                description=f"The **{g['prize']}** giveaway ended with no entries.",
+                color=GW_GRAY,
+            ))
+    except discord.HTTPException as exc:
+        print(f"[giveaway] announcement failed for {gw_id}: {exc}")
+        return
+
+    g["ended"] = True
+    save_giveaways()
 
 
 @tasks.loop(seconds=5)
@@ -1735,6 +1763,7 @@ async def giveaway_cmd(
     if not (1 <= winners <= 20):
         return await interaction.response.send_message("Winner count must be between **1** and **20**.", ephemeral=True)
 
+    await interaction.response.defer()
     end_time = (datetime.now(timezone.utc) + timedelta(seconds=seconds)).timestamp()
     gw_id    = f"{interaction.guild_id}_{int(datetime.now(timezone.utc).timestamp() * 1000)}"
 
@@ -1754,8 +1783,11 @@ async def giveaway_cmd(
 
     view = GiveawayView(gw_id)
     bot.add_view(view)
-    await interaction.response.send_message(embed=build_giveaway_embed(g), view=view)
-    msg = await interaction.original_response()
+    try:
+        msg = await interaction.edit_original_response(embed=build_giveaway_embed(g), view=view)
+    except Exception:
+        giveaways.pop(gw_id, None)
+        raise
     g["message_id"] = msg.id
     save_giveaways()
 
@@ -1972,6 +2004,14 @@ async def _gen_transcript(channel: discord.TextChannel, ticket: dict, cfg: dict 
     try:
         log_ch = client.get_channel(int(cfg["log_channel_id"])) or await client.fetch_channel(int(cfg["log_channel_id"]))
     except Exception:
+        return
+    if not client.intents.message_content:
+        try:
+            await log_ch.send(
+                f"Ticket #{ticket['ticket_num']} closed. A transcript is unavailable while Message Content access is disabled."
+            )
+        except discord.HTTPException:
+            pass
         return
     try:
         msgs = [m async for m in channel.history(limit=100, oldest_first=True)]
@@ -3211,9 +3251,12 @@ async def on_ready():
     _pa_load()
     print(f"Loaded {len(paid_ads)} paid ad(s)")
 
-    update_all_counters.start()
-    giveaway_checker.start()
-    paid_ad_checker.start()
+    if not update_all_counters.is_running():
+        update_all_counters.start()
+    if not giveaway_checker.is_running():
+        giveaway_checker.start()
+    if not paid_ad_checker.is_running():
+        paid_ad_checker.start()
     await _update_presence()
 
     for guild in GUILD_IDS:
