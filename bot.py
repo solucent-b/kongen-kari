@@ -95,6 +95,9 @@ GUILD_IDS = [
     discord.Object(id=1488636168709996548),
     discord.Object(id=1466873878973386931),
 ]
+# "Watching N members" is this server. The other guild is command-sync only.
+PRESENCE_GUILD_ID = 1466873878973386931
+_presence_count: int | None = None
 GOLD     = 0xFFD700
 MEDALS   = ["🥇", "🥈", "🥉"]
 DATA_DIR    = os.getenv("DATA_DIR", ".")
@@ -679,13 +682,35 @@ async def update_all_counters():
     await _update_presence()
 
 
+async def _live_member_count(guild_id: int) -> int:
+    # guild.member_count only moves when Discord sends member join/leave.
+    # Those events are not sent while the Server Members intent is off, so the
+    # cached total freezes at startup and drifts by hundreds. The guild lookup
+    # with counts does not need that intent.
+    try:
+        guild = await bot.fetch_guild(guild_id, with_counts=True)
+    except discord.HTTPException as exc:
+        print(f"[Presence] Member count refresh failed: {exc}", flush=True)
+        cached = bot.get_guild(guild_id)
+        return cached.member_count or 0 if cached else 0
+    count = guild.approximate_member_count or 0
+    cached = bot.get_guild(guild_id)
+    if cached is not None and count:
+        cached.member_count = count
+    return count
+
+
 async def _update_presence():
-    guild = bot.get_guild(1466873878973386931)
-    count = guild.member_count if guild else 0
+    global _presence_count
+    count = await _live_member_count(PRESENCE_GUILD_ID)
+    if count <= 0 or count == _presence_count:
+        return
     await bot.change_presence(activity=discord.Activity(
         type=discord.ActivityType.watching,
         name=f"{count:,} members",
     ))
+    _presence_count = count
+    print(f"[Presence] Watching {count:,} members", flush=True)
 
 
 # ── Chat Counter Setup ────────────────────────────────────────────────────────
