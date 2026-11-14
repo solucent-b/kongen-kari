@@ -18,7 +18,9 @@ load_dotenv()
 intents = discord.Intents.default()
 intents.message_content = os.getenv("ENABLE_MESSAGE_CONTENT_INTENT", "false").lower() in {"1", "true", "yes"}
 # Slash commands and button interactions provide the member data used by this bot.
-intents.members = False
+# The Server Members intent is only needed for an exact "Watching N members"
+# count; without it Discord only gives a cached approximate total.
+intents.members = os.getenv("ENABLE_MEMBERS_INTENT", "false").lower() in {"1", "true", "yes"}
 
 
 def _is_admin(user: discord.Member | discord.User) -> bool:
@@ -75,7 +77,14 @@ class RestrictedCommandTree(app_commands.CommandTree):
         return False
 
 
-bot = commands.Bot(command_prefix="!", intents=intents, tree_cls=RestrictedCommandTree)
+# No startup chunking: the exact member_count comes from GUILD_CREATE and the
+# join/leave events, so downloading every member would only slow startup.
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+    tree_cls=RestrictedCommandTree,
+    chunk_guilds_at_startup=False,
+)
 
 
 @bot.tree.error
@@ -682,10 +691,15 @@ async def update_all_counters():
 
 
 async def _live_member_count(guild_id: int) -> int:
-    # guild.member_count only moves when Discord sends member join/leave.
-    # Those events are not sent while the Server Members intent is off, so the
-    # cached total freezes at startup and drifts by hundreds. The guild lookup
-    # with counts does not need that intent.
+    # With the Server Members intent, Discord sends join/leave events, so the
+    # cached member_count is exact and stays current.
+    if bot.intents.members:
+        cached = bot.get_guild(guild_id)
+        if cached is not None and cached.member_count:
+            return cached.member_count
+    # Without it those events never arrive and the cached total freezes at
+    # startup, so ask Discord. This total is approximate and cached on
+    # Discord's side, so it can be off by around a hundred on a large server.
     try:
         guild = await bot.fetch_guild(guild_id, with_counts=True)
     except discord.HTTPException as exc:
@@ -728,6 +742,18 @@ async def presence_updater():
         await _update_presence()
     except Exception as exc:
         print(f"[Presence] Update failed: {exc}", flush=True)
+
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    if member.guild.id == PRESENCE_GUILD_ID:
+        await _update_presence()
+
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    if member.guild.id == PRESENCE_GUILD_ID:
+        await _update_presence()
 
 
 @presence_updater.before_loop
