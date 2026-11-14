@@ -679,7 +679,6 @@ async def update_all_counters():
                 print(f"[RESET] Counter '{name}' reset. Next reset: {counter['reset_at']}")
         await update_counter_embed(name)
     save_chat_counters()
-    await _update_presence()
 
 
 async def _live_member_count(guild_id: int) -> int:
@@ -700,17 +699,40 @@ async def _live_member_count(guild_id: int) -> int:
     return count
 
 
-async def _update_presence():
+async def _update_presence(force: bool = False):
     global _presence_count
     count = await _live_member_count(PRESENCE_GUILD_ID)
-    if count <= 0 or count == _presence_count:
+    if count <= 0:
+        count = _presence_count or 0
+        if count <= 0:
+            return
+    if count == _presence_count and not force:
         return
-    await bot.change_presence(activity=discord.Activity(
+    activity = discord.Activity(
         type=discord.ActivityType.watching,
         name=f"{count:,} members",
-    ))
+    )
+    # Storing it on the client means a fresh gateway IDENTIFY after a
+    # reconnect sends this activity, instead of coming back with no status.
+    bot.activity = activity
+    await bot.change_presence(activity=activity)
     _presence_count = count
     print(f"[Presence] Watching {count:,} members", flush=True)
+
+
+@tasks.loop(seconds=60)
+async def presence_updater():
+    # Its own loop so a failure elsewhere (e.g. chat counters) can't freeze it,
+    # and an error here can't stop the loop.
+    try:
+        await _update_presence()
+    except Exception as exc:
+        print(f"[Presence] Update failed: {exc}", flush=True)
+
+
+@presence_updater.before_loop
+async def _presence_wait_ready():
+    await bot.wait_until_ready()
 
 
 # ── Chat Counter Setup ────────────────────────────────────────────────────────
@@ -3282,7 +3304,14 @@ async def on_ready():
         giveaway_checker.start()
     if not paid_ad_checker.is_running():
         paid_ad_checker.start()
-    await _update_presence()
+    if not presence_updater.is_running():
+        presence_updater.start()
+    try:
+        # Forced: on_ready also fires after a reconnect, when Discord has
+        # dropped the status even though the count hasn't changed.
+        await _update_presence(force=True)
+    except Exception as exc:
+        print(f"[Presence] Startup update failed: {exc}", flush=True)
 
     for guild in GUILD_IDS:
         try:
